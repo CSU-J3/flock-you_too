@@ -5,6 +5,11 @@
 #include <string.h>
 #include <SPIFFS.h>
 
+// --- Standalone additions ---
+#include "gps_logger.h"
+#include "sd_logger.h"
+#include "silent_mode.h"
+
 // ============================================================
 // CONFIG
 // ============================================================
@@ -19,9 +24,9 @@
 #define LED_ACTIVE_HIGH  0
 #define LED_FLASH_MS     120
 
-#define MIRROR_SERIAL    1
-#define MIRROR_TX_PIN    43
-#define MIRROR_BAUD      115200
+#define MIRROR_SERIAL 0   // GPS now owns Serial1 (GPIO 43/44)
+#define MIRROR_TX_PIN 43
+#define MIRROR_BAUD 115200
 
 #define CHANNEL_MODE_FULL_HOP   0
 #define CHANNEL_MODE_CUSTOM     1
@@ -283,6 +288,7 @@ static void ledTick() {
 
 static void buzzerBeep(unsigned int ms) {
 #if USE_BUZZER
+  if (audioMuted()) return;
   digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW);
 #endif
 }
@@ -290,6 +296,7 @@ static void buzzerBeep(unsigned int ms) {
 // Two fast ascending beeps — played on the FIRST sighting of a MAC.
 static void newDetectChirp() {
 #if USE_BUZZER
+  if (audioMuted()) return;
   tone(BUZZER_PIN, NEW_CHIRP_LO_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
   delay(NEW_CHIRP_GAP_MS);
   tone(BUZZER_PIN, NEW_CHIRP_HI_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
@@ -300,6 +307,7 @@ static void newDetectChirp() {
 // in range (last seen within HB_DEVICE_ACTIVE_MS).
 static void heartbeatBeep() {
 #if USE_BUZZER
+  if (audioMuted()) return;
   tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
   delay(HB_BEEP_GAP_MS);
   tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
@@ -307,6 +315,7 @@ static void heartbeatBeep() {
 }
 static void startupBeep() {
 #if USE_BUZZER
+  if (audioMuted()) return;
   // First 6 notes of SMB World 1-2 (underground). Koji Kondo's descending
   // pattern: C5 → C4 → A4 → A3 → G#4 → G#3 (alternating-octave pairs).
   static const uint16_t notes[6] = { 523, 262, 440, 220, 415, 208 };
@@ -762,6 +771,11 @@ static void fyPromotePrevSession() {
 
 static void emitDetectionJSON(const char* mac, const char* method,
                               int8_t rssi, uint8_t ch, const char* ssid) {
+  // Skip the JSON line entirely on battery — Flask isn't listening,
+  // saves USB CDC overhead. Comment out this guard if you'd rather
+  // always emit (e.g. for serial logging to a separate adapter).
+  if (!usbHostConnected()) return;
+
   char ssidEsc[sizeof(((FYDetection*)0)->ssid) * 6 + 1];
   jsonEscape(ssidEsc, sizeof(ssidEsc), ssid ? ssid : "");
   char oui[9];
@@ -769,6 +783,17 @@ static void emitDetectionJSON(const char* mac, const char* method,
   sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
          &mbytes[0], &mbytes[1], &mbytes[2], &mbytes[3], &mbytes[4], &mbytes[5]);
   ouiFromMac(mbytes, oui, sizeof(oui));
+
+  // Build optional GPS suffix.
+  char gpsField[96] = "";
+  const GpsFix& fix = gpsCurrentFix();
+  if (fix.valid) {
+    // Flask uses gps.accuracy for the marker radius in meters.
+    // HDOP * 5 is a rough conversion (HDOP ~1 = ~5m).
+    snprintf(gpsField, sizeof(gpsField),
+             ",\"gps\":{\"latitude\":%.6f,\"longitude\":%.6f,\"accuracy\":%.1f}",
+             fix.lat, fix.lon, fix.hdop * 5.0f);
+  }
 
   dualPrintf(
       "{\"event\":\"detection\","
@@ -780,9 +805,9 @@ static void emitDetectionJSON(const char* mac, const char* method,
       "\"rssi\":%d,"
       "\"channel\":%u,"
       "\"frequency\":%u,"
-      "\"ssid\":\"%s\"}\n",
+      "\"ssid\":\"%s\"%s}\n",
       method, mac, oui, rssi,
-      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc);
+      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc, gpsField);
 }
 
 // ============================================================
@@ -996,6 +1021,10 @@ static void drainAlertQueue() {
     emitDetectionJSON(macStr, method, e.rssi, e.channel,
                       (e.type == ALERT_SSID) ? e.ssid : "");
 
+    // SD wardriving log — always-on regardless of USB state.
+    sdLogDetection(macStr, method, e.rssi, e.channel,
+                   (e.type == ALERT_SSID) ? e.ssid : "");
+
     // Audio feedback:
     //   - NEW MAC  → two fast ascending beeps (clearly distinct sound)
     //   - REPEAT   → silent; the heartbeat tick covers continued presence
@@ -1063,6 +1092,12 @@ void setup() {
   ledSet(false);
 #endif
 
+  // --- Standalone additions ---
+  silentInit();   // do this early so startupBeep respects mute
+  gpsInit();      // takes ~5ms to set up Serial1
+  sdInit();       // logs result via Serial.printf; non-fatal if it fails
+  // ----------------------------
+
   startupBeep();
 #if USE_LED
   ledFlash(200);
@@ -1112,9 +1147,17 @@ void setup() {
 }
 
 void loop() {
+  // --- Standalone additions ---
+  gpsPoll();                  // drain NMEA from Serial1
+  silentPoll();               // refresh mute state ~4x/sec
+  sdMaybeRotateFilename();    // promote /fy_boot_*.csv -> /flockyou_<ts>.csv once
+  // ----------------------------
+
   updateChannelMode();
   drainAlertQueue();   // Serial.printf happens here, not in callback
-  autosaveTick();      // periodic SPIFFS write if dirty
+  if (!usbHostConnected()) {
+    autosaveTick();    // periodic SPIFFS write if dirty (skip on USB — Flask is live)
+  }
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
   printHeartbeat();
